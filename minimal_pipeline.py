@@ -156,8 +156,8 @@ def list_available_tables():
 
 
 def send_to_hubspot_contacts(contacts_data: List[Dict[str, Any]]):
-    """Send contact data to HubSpot using email-based search and update/create approach"""
-    print(f"📞 Sending {len(contacts_data)} contacts to HubSpot...")
+    """Send contact data to HubSpot using optimized batch processing"""
+    print(f"📞 Sending {len(contacts_data)} contacts to HubSpot using batch processing...")
     
     api_key = os.getenv("HUBSPOT_API_KEY")
     headers = {
@@ -165,18 +165,61 @@ def send_to_hubspot_contacts(contacts_data: List[Dict[str, Any]]):
         "Content-Type": "application/json"
     }
     
-    success_count = 0
-    updated_count = 0
-    created_count = 0
+    # Step 1: Batch search for existing contacts by email
+    print(f"🔍 Step 1: Batch searching for existing contacts...")
+    emails_to_search = [contact.get("EMAIL") for contact in contacts_data if contact.get("EMAIL")]
     
-    # Handle each contact individually using email-based search
-    for i, contact in enumerate(contacts_data):
+    # Handle case where there are no emails
+    if not emails_to_search:
+        print("   ❌ No valid email addresses found in contact data")
+        return
+    
+    existing_contacts = {}
+    batch_size = 100  # HubSpot limit
+    
+    for i in range(0, len(emails_to_search), batch_size):
+        batch_emails = emails_to_search[i:i+batch_size]
+        
+        # Use batch search API
+        search_payload = {
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "email",
+                    "operator": "IN",
+                    "values": batch_emails
+                }]
+            }],
+            "properties": ["email"],
+            "limit": 100
+        }
+        
+        try:
+            search_url = "https://api.hubapi.com/crm/v3/objects/contacts/search"
+            response = requests.post(search_url, headers=headers, json=search_payload, timeout=30)
+            
+            if response.status_code == 200:
+                results = response.json().get("results", [])
+                for result in results:
+                    email = result["properties"].get("email")
+                    if email:
+                        existing_contacts[email] = result["id"]
+                print(f"   Found {len(results)} existing contacts in batch {i//batch_size + 1}")
+            else:
+                print(f"❌ Batch search failed: {response.status_code} - {response.text[:200]}")
+        except Exception as e:
+            print(f"❌ Error in batch search: {str(e)}")
+    
+    print(f"📋 Found {len(existing_contacts)} existing contacts out of {len(contacts_data)}")
+    
+    # Step 2: Separate existing and new contacts
+    contacts_to_update = []
+    contacts_to_create = []
+    
+    for contact in contacts_data:
         email = contact.get("EMAIL")
         if not email:
-            print(f"❌ Skipping contact {i+1}: No email address")
             continue
             
-        # Map your Snowflake columns to HubSpot properties
         hubspot_properties = {
             "email": email,
             "firstname": contact.get("FIRSTNAME"),
@@ -196,46 +239,63 @@ def send_to_hubspot_contacts(contacts_data: List[Dict[str, Any]]):
         # Remove None values and convert to strings
         hubspot_properties = {k: str(v) if v is not None else "" for k, v in hubspot_properties.items() if v is not None}
         
-        try:
-            # First, search for existing contact by email
-            search_url = f"https://api.hubapi.com/crm/v3/objects/contacts/{email}?idProperty=email"
-            search_response = requests.get(search_url, headers=headers, timeout=10)
+        if email in existing_contacts:
+            contacts_to_update.append({
+                "id": existing_contacts[email],
+                "properties": hubspot_properties
+            })
+        else:
+            contacts_to_create.append({
+                "properties": hubspot_properties
+            })
+    
+    success_count = 0
+    updated_count = 0
+    created_count = 0
+    
+    # Step 3: Batch update existing contacts
+    if contacts_to_update:
+        print(f"🔄 Step 3: Batch updating {len(contacts_to_update)} existing contacts...")
+        for i in range(0, len(contacts_to_update), batch_size):
+            batch = contacts_to_update[i:i+batch_size]
             
-            if search_response.status_code == 200:
-                # Contact exists - update it
-                existing_contact = search_response.json()
-                contact_id = existing_contact.get("id")
-                
-                update_payload = {"properties": hubspot_properties}
-                update_url = f"https://api.hubapi.com/crm/v3/objects/contacts/{contact_id}"
-                response = requests.patch(update_url, headers=headers, json=update_payload, timeout=10)
+            try:
+                update_payload = {"inputs": batch}
+                update_url = "https://api.hubapi.com/crm/v3/objects/contacts/batch/update"
+                response = requests.post(update_url, headers=headers, json=update_payload, timeout=30)
                 
                 if response.status_code == 200:
-                    success_count += 1
-                    updated_count += 1
-                    if i % 10 == 0 or i < 5:  # Show progress
-                        print(f"✅ Updated contact {i+1}/{len(contacts_data)}: {email}")
+                    batch_results = response.json().get("results", [])
+                    batch_success = len(batch_results)
+                    success_count += batch_success
+                    updated_count += batch_success
+                    print(f"   ✅ Batch {i//batch_size + 1}: Updated {batch_success}/{len(batch)} contacts")
                 else:
-                    print(f"❌ Failed to update contact {email}: {response.status_code} - {response.text[:100]}")
-                    
-            elif search_response.status_code == 404:
-                # Contact doesn't exist - create it
-                create_payload = {"properties": hubspot_properties}
-                create_url = "https://api.hubapi.com/crm/v3/objects/contacts"
-                response = requests.post(create_url, headers=headers, json=create_payload, timeout=10)
+                    print(f"   ❌ Batch {i//batch_size + 1} update failed: {response.status_code} - {response.text[:200]}")
+            except Exception as e:
+                print(f"   ❌ Error updating batch {i//batch_size + 1}: {str(e)}")
+    
+    # Step 4: Batch create new contacts
+    if contacts_to_create:
+        print(f"➕ Step 4: Batch creating {len(contacts_to_create)} new contacts...")
+        for i in range(0, len(contacts_to_create), batch_size):
+            batch = contacts_to_create[i:i+batch_size]
+            
+            try:
+                create_payload = {"inputs": batch}
+                create_url = "https://api.hubapi.com/crm/v3/objects/contacts/batch/create"
+                response = requests.post(create_url, headers=headers, json=create_payload, timeout=30)
                 
                 if response.status_code == 201:
-                    success_count += 1
-                    created_count += 1
-                    if i % 10 == 0 or i < 5:  # Show progress
-                        print(f"✅ Created contact {i+1}/{len(contacts_data)}: {email}")
+                    batch_results = response.json().get("results", [])
+                    batch_success = len(batch_results)
+                    success_count += batch_success
+                    created_count += batch_success
+                    print(f"   ✅ Batch {i//batch_size + 1}: Created {batch_success}/{len(batch)} contacts")
                 else:
-                    print(f"❌ Failed to create contact {email}: {response.status_code} - {response.text[:100]}")
-            else:
-                print(f"❌ Failed to search for contact {email}: {search_response.status_code} - {search_response.text[:100]}")
-                
-        except Exception as e:
-            print(f"❌ Error processing contact {email}: {str(e)}")
+                    print(f"   ❌ Batch {i//batch_size + 1} create failed: {response.status_code} - {response.text[:200]}")
+            except Exception as e:
+                print(f"   ❌ Error creating batch {i//batch_size + 1}: {str(e)}")
     
     print(f"📊 HubSpot contacts sync completed:")
     print(f"   ✅ Total successful: {success_count}/{len(contacts_data)}")
@@ -297,8 +357,8 @@ def send_to_hubspot_deals(deals_data: List[Dict[str, Any]]):
 
 
 def send_to_hubspot_companies(companies_data: List[Dict[str, Any]]):
-    """Send company data to HubSpot using name/domain-based search and update/create approach"""
-    print(f"🏢 Sending {len(companies_data)} companies to HubSpot...")
+    """Send company data to HubSpot using optimized batch processing"""
+    print(f"🏢 Sending {len(companies_data)} companies to HubSpot using batch processing...")
     
     api_key = os.getenv("HUBSPOT_API_KEY")
     headers = {
@@ -306,23 +366,64 @@ def send_to_hubspot_companies(companies_data: List[Dict[str, Any]]):
         "Content-Type": "application/json"
     }
     
-    success_count = 0
-    updated_count = 0
-    created_count = 0
+    # Step 1: Batch search for existing companies by name
+    print(f"🔍 Step 1: Batch searching for existing companies...")
+    company_names_to_search = [company.get("NAME") for company in companies_data if company.get("NAME")]
     
-    # Handle each company individually using name/domain-based search
-    for i, company in enumerate(companies_data):
-        company_name = company.get("NAME")
-        domain = company.get("DOMAIN")
+    # Handle case where there are no company names
+    if not company_names_to_search:
+        print("   ❌ No valid company names found in company data")
+        return
+    
+    existing_companies = {}
+    batch_size = 100  # HubSpot limit
+    
+    for i in range(0, len(company_names_to_search), batch_size):
+        batch_names = company_names_to_search[i:i+batch_size]
         
+        # Use batch search API
+        search_payload = {
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "name",
+                    "operator": "IN",
+                    "values": batch_names
+                }]
+            }],
+            "properties": ["name"],
+            "limit": 100
+        }
+        
+        try:
+            search_url = "https://api.hubapi.com/crm/v3/objects/companies/search"
+            response = requests.post(search_url, headers=headers, json=search_payload, timeout=30)
+            
+            if response.status_code == 200:
+                results = response.json().get("results", [])
+                for result in results:
+                    name = result["properties"].get("name")
+                    if name:
+                        existing_companies[name] = result["id"]
+                print(f"   Found {len(results)} existing companies in batch {i//batch_size + 1}")
+            else:
+                print(f"❌ Batch search failed: {response.status_code} - {response.text[:200]}")
+        except Exception as e:
+            print(f"❌ Error in batch search: {str(e)}")
+    
+    print(f"📋 Found {len(existing_companies)} existing companies out of {len(companies_data)}")
+    
+    # Step 2: Separate existing and new companies
+    companies_to_update = []
+    companies_to_create = []
+    
+    for company in companies_data:
+        company_name = company.get("NAME")
         if not company_name:
-            print(f"❌ Skipping company {i+1}: No company name")
             continue
             
-        # Map your Snowflake columns to HubSpot company properties
         hubspot_properties = {
             "name": company_name,
-            "domain": domain, 
+            "domain": company.get("DOMAIN"), 
             "website": company.get("WEBSITE"),
             "phone": company.get("PHONE"),
             "city": company.get("CITY"),
@@ -338,70 +439,63 @@ def send_to_hubspot_companies(companies_data: List[Dict[str, Any]]):
         # Remove None values and convert to strings
         hubspot_properties = {k: str(v) if v is not None else "" for k, v in hubspot_properties.items() if v is not None}
         
-        try:
-            # First, try to search for existing company by domain (if available)
-            existing_company = None
-            if domain:
-                search_url = f"https://api.hubapi.com/crm/v3/objects/companies/{domain}?idProperty=domain"
-                search_response = requests.get(search_url, headers=headers, timeout=10)
-                
-                if search_response.status_code == 200:
-                    existing_company = search_response.json()
+        if company_name in existing_companies:
+            companies_to_update.append({
+                "id": existing_companies[company_name],
+                "properties": hubspot_properties
+            })
+        else:
+            companies_to_create.append({
+                "properties": hubspot_properties
+            })
+    
+    success_count = 0
+    updated_count = 0
+    created_count = 0
+    
+    # Step 3: Batch update existing companies
+    if companies_to_update:
+        print(f"🔄 Step 3: Batch updating {len(companies_to_update)} existing companies...")
+        for i in range(0, len(companies_to_update), batch_size):
+            batch = companies_to_update[i:i+batch_size]
             
-            # If not found by domain, try searching by name using search API
-            if not existing_company:
-                search_payload = {
-                    "filterGroups": [
-                        {
-                            "filters": [
-                                {
-                                    "propertyName": "name",
-                                    "operator": "EQ",
-                                    "value": company_name
-                                }
-                            ]
-                        }
-                    ]
-                }
-                search_url = "https://api.hubapi.com/crm/v3/objects/companies/search"
-                search_response = requests.post(search_url, headers=headers, json=search_payload, timeout=10)
-                
-                if search_response.status_code == 200:
-                    search_results = search_response.json()
-                    if search_results.get("results"):
-                        existing_company = search_results["results"][0]  # Take first match
-            
-            if existing_company:
-                # Company exists - update it
-                company_id = existing_company.get("id")
-                
-                update_payload = {"properties": hubspot_properties}
-                update_url = f"https://api.hubapi.com/crm/v3/objects/companies/{company_id}"
-                response = requests.patch(update_url, headers=headers, json=update_payload, timeout=10)
+            try:
+                update_payload = {"inputs": batch}
+                update_url = "https://api.hubapi.com/crm/v3/objects/companies/batch/update"
+                response = requests.post(update_url, headers=headers, json=update_payload, timeout=30)
                 
                 if response.status_code == 200:
-                    success_count += 1
-                    updated_count += 1
-                    if i % 5 == 0 or i < 5:  # Show progress
-                        print(f"✅ Updated company {i+1}/{len(companies_data)}: {company_name}")
+                    batch_results = response.json().get("results", [])
+                    batch_success = len(batch_results)
+                    success_count += batch_success
+                    updated_count += batch_success
+                    print(f"   ✅ Batch {i//batch_size + 1}: Updated {batch_success}/{len(batch)} companies")
                 else:
-                    print(f"❌ Failed to update company {company_name}: {response.status_code} - {response.text[:100]}")
-            else:
-                # Company doesn't exist - create it
-                create_payload = {"properties": hubspot_properties}
-                create_url = "https://api.hubapi.com/crm/v3/objects/companies"
-                response = requests.post(create_url, headers=headers, json=create_payload, timeout=10)
+                    print(f"   ❌ Batch {i//batch_size + 1} update failed: {response.status_code} - {response.text[:200]}")
+            except Exception as e:
+                print(f"   ❌ Error updating batch {i//batch_size + 1}: {str(e)}")
+    
+    # Step 4: Batch create new companies
+    if companies_to_create:
+        print(f"➕ Step 4: Batch creating {len(companies_to_create)} new companies...")
+        for i in range(0, len(companies_to_create), batch_size):
+            batch = companies_to_create[i:i+batch_size]
+            
+            try:
+                create_payload = {"inputs": batch}
+                create_url = "https://api.hubapi.com/crm/v3/objects/companies/batch/create"
+                response = requests.post(create_url, headers=headers, json=create_payload, timeout=30)
                 
                 if response.status_code == 201:
-                    success_count += 1
-                    created_count += 1
-                    if i % 5 == 0 or i < 5:  # Show progress
-                        print(f"✅ Created company {i+1}/{len(companies_data)}: {company_name}")
+                    batch_results = response.json().get("results", [])
+                    batch_success = len(batch_results)
+                    success_count += batch_success
+                    created_count += batch_success
+                    print(f"   ✅ Batch {i//batch_size + 1}: Created {batch_success}/{len(batch)} companies")
                 else:
-                    print(f"❌ Failed to create company {company_name}: {response.status_code} - {response.text[:100]}")
-                
-        except Exception as e:
-            print(f"❌ Error processing company {company_name}: {str(e)}")
+                    print(f"   ❌ Batch {i//batch_size + 1} create failed: {response.status_code} - {response.text[:200]}")
+            except Exception as e:
+                print(f"   ❌ Error creating batch {i//batch_size + 1}: {str(e)}")
     
     print(f"📊 HubSpot companies sync completed:")
     print(f"   ✅ Total successful: {success_count}/{len(companies_data)}")
