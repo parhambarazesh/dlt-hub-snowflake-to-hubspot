@@ -1,0 +1,17 @@
+# DLT Hub Pipeline Requirements - Simple Direct Transfer
+# Snowflake to HubSpot Data Synchronization (RSA Key Auth)
+
+# Core DLT package with specific destination support
+dlt[snowflake,hubspot]>=0.3.0
+
+# Database connectors
+snowflake-connector-python>=3.0.0
+
+# RSA key authentication
+cryptography>=3.0.0
+
+# Environment management  
+python-dotenv>=1.0.0
+
+# HTTP client for API calls
+requests>=2.31.0
