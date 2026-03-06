@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.production
+venv/
 
 # DLT Hub files
 .dlt/
