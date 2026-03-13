@@ -19,7 +19,10 @@ from typing import Any, Generator
 import dlt
 import requests
 
-from src.auth import SnowflakeJWTAuth
+try:
+    from .auth import SnowflakeJWTAuth
+except ImportError:
+    from src.auth import SnowflakeJWTAuth
 
 logger = logging.getLogger(__name__)
 

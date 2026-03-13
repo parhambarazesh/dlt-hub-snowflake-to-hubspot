@@ -8,6 +8,8 @@ Implements the upsert strategy from ADR-003:
 """
 
 import logging
+import json
+import re
 from typing import Any
 
 import dlt
@@ -24,6 +26,54 @@ ENTITY_CONFIG = {
     "contacts": ("contacts", "email"),
     "companies": ("companies", "name"),
 }
+
+
+def _extract_invalid_properties(error_text: str) -> set[str]:
+    """Extract invalid property names from HubSpot error payload text."""
+    names: set[str] = set()
+
+    # 1) Try raw text matches
+    names.update(re.findall(r'"name":"([^"]+)"', error_text))
+    names.update(re.findall(r'\\"name\\":\\"([^\\"]+)\\"', error_text))
+
+    # 2) Try parsing JSON and inspect structured fields
+    try:
+        payload = json.loads(error_text)
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, str):
+            names.update(re.findall(r'"name":"([^"]+)"', message))
+
+        for err in payload.get("errors", []) or []:
+            if isinstance(err, dict):
+                context = err.get("context", {})
+                if isinstance(context, dict):
+                    prop_names = context.get("propertyName", [])
+                    if isinstance(prop_names, list):
+                        for n in prop_names:
+                            if isinstance(n, str):
+                                names.add(n)
+
+    return names
+
+
+def _strip_invalid_properties(
+    batch: list[dict[str, Any]], invalid_properties: set[str]
+) -> list[dict[str, Any]]:
+    """Return a copy of batch inputs with invalid properties removed."""
+    cleaned: list[dict[str, Any]] = []
+    for item in batch:
+        props = item.get("properties", {})
+        filtered_props = {
+            k: v for k, v in props.items() if k not in invalid_properties
+        }
+        new_item = dict(item)
+        new_item["properties"] = filtered_props
+        cleaned.append(new_item)
+    return cleaned
 
 
 def _hubspot_headers(api_key: str) -> dict[str, str]:
@@ -114,6 +164,41 @@ def _batch_create(
                 entity_type,
                 i // HUBSPOT_BATCH_LIMIT + 1,
             )
+        elif resp.status_code == 400:
+            invalid_props = _extract_invalid_properties(resp.text)
+            if invalid_props:
+                logger.warning(
+                    "Create batch %d failed with invalid properties %s; retrying without them.",
+                    i // HUBSPOT_BATCH_LIMIT + 1,
+                    sorted(invalid_props),
+                )
+                retry_batch = _strip_invalid_properties(batch, invalid_props)
+                retry_resp = requests.post(
+                    url,
+                    headers=headers,
+                    json={"inputs": retry_batch},
+                    timeout=HUBSPOT_TIMEOUT,
+                )
+                if retry_resp.status_code in (200, 201):
+                    batch_created = len(retry_resp.json().get("results", []))
+                    created += batch_created
+                    logger.info(
+                        "Created %d/%d %s after retry (batch %d)",
+                        batch_created,
+                        len(batch),
+                        entity_type,
+                        i // HUBSPOT_BATCH_LIMIT + 1,
+                    )
+                else:
+                    logger.error(
+                        "Batch create retry failed (%d): %s",
+                        retry_resp.status_code,
+                        retry_resp.text[:300],
+                    )
+            else:
+                logger.error(
+                    "Batch create failed (400): %s", resp.text[:300]
+                )
         else:
             logger.error(
                 "Batch create failed (%d): %s", resp.status_code, resp.text[:300]
@@ -155,6 +240,41 @@ def _batch_update(
                 entity_type,
                 i // HUBSPOT_BATCH_LIMIT + 1,
             )
+        elif resp.status_code == 400:
+            invalid_props = _extract_invalid_properties(resp.text)
+            if invalid_props:
+                logger.warning(
+                    "Update batch %d failed with invalid properties %s; retrying without them.",
+                    i // HUBSPOT_BATCH_LIMIT + 1,
+                    sorted(invalid_props),
+                )
+                retry_batch = _strip_invalid_properties(batch, invalid_props)
+                retry_resp = requests.post(
+                    url,
+                    headers=headers,
+                    json={"inputs": retry_batch},
+                    timeout=HUBSPOT_TIMEOUT,
+                )
+                if retry_resp.status_code == 200:
+                    batch_updated = len(retry_resp.json().get("results", []))
+                    updated += batch_updated
+                    logger.info(
+                        "Updated %d/%d %s after retry (batch %d)",
+                        batch_updated,
+                        len(batch),
+                        entity_type,
+                        i // HUBSPOT_BATCH_LIMIT + 1,
+                    )
+                else:
+                    logger.error(
+                        "Batch update retry failed (%d): %s",
+                        retry_resp.status_code,
+                        retry_resp.text[:300],
+                    )
+            else:
+                logger.error(
+                    "Batch update failed (400): %s", resp.text[:300]
+                )
         else:
             logger.error(
                 "Batch update failed (%d): %s", resp.status_code, resp.text[:300]
@@ -165,7 +285,7 @@ def _batch_update(
 
 @dlt.destination(
     batch_size=HUBSPOT_BATCH_LIMIT,
-    loader_file_format="jsonl",
+    loader_file_format="typed-jsonl",
     name="hubspot",
     naming_convention="direct",
     skip_dlt_columns_and_tables=True,
